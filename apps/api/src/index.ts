@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import type { HealthResponse } from '@url-generator/shared';
+import { checkDatabase, closeDatabase } from './db/client.js';
 import { env } from './env.js';
 
 const SERVICE_NAME = 'url-generator-api';
@@ -14,17 +15,28 @@ const app = Fastify({
 });
 
 /**
- * Liveness/readiness probe.
+ * Liveness probe, plus the state of everything the API depends on.
  *
- * Phase 0 reports only on the process itself. Once the database is wired up in
- * Phase 1 this grows a dependency check and can report `degraded`.
+ * Always answers 200 while the process can serve a request. A database outage
+ * shows up as `status: 'degraded'` in the body rather than as a failed probe,
+ * because restarting the API would not fix Postgres and would only take the
+ * cached read path (Phase 4) down with it.
  */
 app.get('/health', async (): Promise<HealthResponse> => {
+  const database = await checkDatabase();
+
   return {
-    status: 'ok',
+    status: database.reachable ? 'ok' : 'degraded',
     service: SERVICE_NAME,
     version: VERSION,
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+    dependencies: {
+      database: {
+        status: database.reachable ? 'ok' : 'unreachable',
+        latencyMs: database.latencyMs,
+        ...(database.error === undefined ? {} : { error: database.error }),
+      },
+    },
   };
 });
 
@@ -38,11 +50,15 @@ async function start(): Promise<void> {
 }
 
 // Compose sends SIGTERM on `docker compose down`; close connections cleanly so
-// in-flight requests are not severed mid-response.
+// in-flight requests are not severed mid-response and Postgres is not left
+// holding sessions nobody is on the other end of.
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.on(signal, () => {
     app.log.info(`received ${signal}, shutting down`);
-    void app.close().then(() => process.exit(0));
+    void app
+      .close()
+      .then(() => closeDatabase())
+      .then(() => process.exit(0));
   });
 }
 

@@ -7,12 +7,30 @@
  * both services stay on a single source of truth for the wire format.
  */
 
-/** Response body of `GET /health` on the API service. */
+/** Health of one thing the API depends on. */
+export interface DependencyHealth {
+  status: 'ok' | 'unreachable';
+  /** Round-trip time of the probe, including the time spent failing. */
+  latencyMs: number;
+  /** Present only when `status` is `unreachable`. */
+  error?: string;
+}
+
+/**
+ * Response body of `GET /health` on the API service.
+ *
+ * `status` is `degraded` when the process is up but something it depends on is
+ * not. The endpoint still answers 200 in that case: it reports liveness, and an
+ * orchestrator should not restart a healthy API because the database blinked.
+ */
 export interface HealthResponse {
   status: 'ok' | 'degraded';
   service: string;
   version: string;
   uptimeSeconds: number;
+  dependencies: {
+    database: DependencyHealth;
+  };
 }
 
 /**

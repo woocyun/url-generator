@@ -1,5 +1,24 @@
 name: url-generator
 
+# The API image serves two roles — the long-running server and the one-shot
+# migration job (ADR 0006) — so its build and its database wiring are defined
+# once here and referenced by both services.
+x-api-build: &api-build
+  build:
+    context: .
+    dockerfile: apps/api/Dockerfile
+    target: dev
+  image: url-generator-api:dev
+  volumes:
+    # Bind-mount the workspace for hot reload, but keep the container's own
+    # node_modules: the host tree may be absent or built for a different
+    # platform.
+    - .:/app
+    - /app/node_modules
+
+x-database-url: &database-url
+  DATABASE_URL: postgres://${POSTGRES_USER:-urlshortener}:${POSTGRES_PASSWORD:-urlshortener}@postgres:5432/${POSTGRES_DB:-urlshortener}
+
 services:
   postgres:
     image: postgres:18-alpine
@@ -24,27 +43,35 @@ services:
       retries: 12
       start_period: 10s
 
+  # Applies pending migrations and exits. The API waits on it completing
+  # successfully, so the schema is never behind the code that queries it, and a
+  # broken migration stops the stack here instead of surfacing as runtime
+  # errors. Idempotent: re-running it on an up-to-date database is a no-op.
+  migrate:
+    <<: *api-build
+    restart: "no"
+    environment:
+      NODE_ENV: development
+      <<: *database-url
+    command: ["npm", "run", "db:migrate", "--workspace", "@url-generator/api"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
-      target: dev
+    <<: *api-build
     restart: unless-stopped
     environment:
       NODE_ENV: development
       API_PORT: 4000
-      DATABASE_URL: postgres://${POSTGRES_USER:-urlshortener}:${POSTGRES_PASSWORD:-urlshortener}@postgres:5432/${POSTGRES_DB:-urlshortener}
+      <<: *database-url
     ports:
       - "${API_PORT:-4000}:4000"
-    volumes:
-      # Bind-mount the workspace for hot reload, but keep the container's own
-      # node_modules: the host tree may be absent or built for a different
-      # platform.
-      - .:/app
-      - /app/node_modules
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   web:
     build:
