@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+.npm
+
+# builds
+dist/
+.next/
+out/
+*.tsbuildinfo
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# docker
+.docker-data/
+
+# design docs — kept local for now
+docs/
