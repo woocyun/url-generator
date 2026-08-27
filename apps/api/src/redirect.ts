@@ -20,6 +20,7 @@
 
 import { cacheTarget, readCachedTarget } from './cache/redirect-cache.js';
 import { findRedirectTarget, type RedirectTarget } from './db/mappings.js';
+import { hasExpired } from './ttl.js';
 import { isRedirectableUrl } from './url.js';
 
 /** Where the answer came from. Reported so the hit rate is observable. */
@@ -106,11 +107,20 @@ export async function resolveShortCode(
     return { outcome: 'not-found', source };
   }
 
-  // NULL means the link never expires (design §6). Phase 6 is what sets a
-  // non-NULL value; until then this branch is only reachable by a row written
-  // by hand, and it is here first so that when Phase 6 lands, the read path
-  // already honours what it writes.
-  if (target.expiresAt !== null && target.expiresAt.getTime() <= now.getTime()) {
+  // NULL means the link never expires (design §6). Phase 6 is what fills this
+  // column in, and it deliberately did not change the line below: the read path
+  // has honoured expiry since Phase 3, so the feature landed on the write path
+  // and in a cleanup job rather than here.
+  //
+  // The test itself moved to `ttl.ts` and stayed identical. Three components
+  // now decide whether a link is expired — this one, the write path's revive,
+  // and the sweep that deletes the row — and them disagreeing is how a link
+  // gets buried by one and resurrected by another.
+  // The explicit null check is redundant against `hasExpired` and kept for the
+  // narrowing: `expiredAt` is on the wire in the 410, and a type predicate that
+  // said "true implies Date" would also claim the false branch implies NULL,
+  // which is precisely wrong for a link that has not expired yet.
+  if (target.expiresAt !== null && hasExpired(target.expiresAt, now)) {
     return { outcome: 'expired', expiredAt: target.expiresAt, source };
   }
 

@@ -105,6 +105,12 @@ services:
       API_PORT: 4000
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:4000}
       REDIS_URL: redis://redis:6379
+      # Both empty by default, which `env.ts` reads as unset: links are
+      # permanent unless a caller asks otherwise, and there is no ceiling on
+      # what they may ask for. A deployment with a retention policy fills these
+      # in (ADR 0011).
+      DEFAULT_LINK_TTL_SECONDS: ${DEFAULT_LINK_TTL_SECONDS:-}
+      MAX_LINK_TTL_SECONDS: ${MAX_LINK_TTL_SECONDS:-}
       <<: *database-url
     ports:
       - "${API_PORT:-4000}:4000"
@@ -119,6 +125,44 @@ services:
       # on Redis here would make a dependency out of the one component the read
       # path is designed not to need — and would mean a Redis that fails to
       # start takes the whole stack with it.
+      redis:
+        condition: service_started
+
+  # Deletes links that expired longer than EXPIRY_RETENTION_SECONDS ago, on an
+  # interval (ADR 0011). Its own service rather than a timer inside the API for
+  # the reasons in `src/expiry/run.ts`: the API's connection pool belongs to the
+  # read path, one sweeper is enough however many API replicas there are, and a
+  # background job you can stop without stopping the API is a job you can stop
+  # during an incident.
+  #
+  # Nothing about expiry depends on this running. `GET /{code}` refuses an
+  # expired link whether or not the row is still there, so a sweeper that is
+  # down means a table that grows and aliases that stay locked up — not links
+  # that come back to life. It gets `restart: unless-stopped` all the same,
+  # because a job that quietly stops running is the failure mode worth guarding.
+  #
+  # It waits on migrate for the partial index it queries through, and starts
+  # alongside Redis rather than behind it: the entries it invalidates are an
+  # optimization, and a cache that is down turns each one into a no-op.
+  sweep:
+    <<: *api-build
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      REDIS_URL: redis://redis:6379
+      EXPIRY_RETENTION_SECONDS: ${EXPIRY_RETENTION_SECONDS:-604800}
+      EXPIRY_SWEEP_INTERVAL_SECONDS: ${EXPIRY_SWEEP_INTERVAL_SECONDS:-300}
+      EXPIRY_SWEEP_BATCH_SIZE: ${EXPIRY_SWEEP_BATCH_SIZE:-500}
+      # One connection is all a serial batch loop uses; the default of 10 would
+      # be nine sessions held open to run one DELETE at a time.
+      DATABASE_POOL_MAX: 2
+      <<: *database-url
+    command: ["npm", "run", "db:sweep", "--workspace", "@url-generator/api"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_started
 

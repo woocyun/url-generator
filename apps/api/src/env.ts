@@ -80,6 +80,26 @@ function readInt(name: string, fallback: number): number {
   return parsed;
 }
 
+/**
+ * Reads a positive integer that may legitimately be absent.
+ *
+ * Distinct from `readInt` with a fallback because for the two TTL bounds below
+ * "unset" is not a number at all — it is the absence of a policy. A default
+ * TTL of zero, or a maximum of infinity, would both have to be spelled as
+ * numbers that mean "ignore me", and every reader of those values would then
+ * have to know the sentinel. `undefined` says it in the type.
+ */
+function readOptionalInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer, got: ${raw}`);
+  }
+  return parsed;
+}
+
 export const env = {
   port: readPort('API_PORT', 4000),
   host: process.env.API_HOST ?? '0.0.0.0',
@@ -142,4 +162,63 @@ export const env = {
    * long enough to absorb a scanner walking the code space.
    */
   cacheNegativeTtlSeconds: readInt('CACHE_NEGATIVE_TTL_SECONDS', 30),
+
+  /**
+   * How long a link lives when the caller does not say (F4).
+   *
+   * Unset means links are permanent unless asked otherwise, which is the
+   * behaviour every phase before this one had, and it is the right default for
+   * a shortener: a link that quietly stops working is worse than one that
+   * outlives its usefulness. A deployment with a retention policy sets this and
+   * gets it applied to every link created without an explicit `expiresIn`.
+   */
+  defaultLinkTtlSeconds: readOptionalInt('DEFAULT_LINK_TTL_SECONDS'),
+
+  /**
+   * The longest TTL this deployment will issue, including "never".
+   *
+   * The separate knob is what makes `expiresIn: null` honest. A default is a
+   * convenience and a caller is allowed to decline it; a maximum is a policy
+   * and a caller is not. Unset means no ceiling, so the two together cover
+   * every deployment: none of this configured is a permanent-link service,
+   * a default alone nudges, and a maximum enforces.
+   */
+  maxLinkTtlSeconds: readOptionalInt('MAX_LINK_TTL_SECONDS'),
+
+  /**
+   * How long an expired row is kept before the sweep deletes it.
+   *
+   * This is the lifetime of the 410. `GET /{code}` can only answer "this link
+   * existed and ran out" while the row is there to say so; once it is gone the
+   * same code is a 404 (ADR 0008). Deleting on the stroke of expiry would make
+   * the 410 unobservable in practice — the sweep would erase it within one
+   * interval — so the row outlives the link on purpose.
+   *
+   * A week is long enough that whoever clicks a just-expired link gets told
+   * what happened, and short enough that a claimed alias does not stay locked
+   * up long after the link using it died.
+   */
+  expiryRetentionSeconds: readInt('EXPIRY_RETENTION_SECONDS', 604_800),
+
+  /**
+   * How often the sweep runs, and how much it removes in one statement.
+   *
+   * Expiry is enforced on read (`redirect.ts`), so the sweep is storage
+   * hygiene rather than correctness and nothing goes wrong if it runs late.
+   * That is what licenses the batching: `DELETE` takes a row lock per row, and
+   * an unbounded one against a table the read path is using would hold
+   * thousands of them for as long as it took.
+   */
+  expirySweepIntervalSeconds: readInt('EXPIRY_SWEEP_INTERVAL_SECONDS', 300),
+  expirySweepBatchSize: readInt('EXPIRY_SWEEP_BATCH_SIZE', 500),
+
+  /**
+   * Batches one pass will run before stopping until the next interval.
+   *
+   * A backlog — the first sweep after this phase ships, or after the job has
+   * been down — should be worked through over several passes rather than in
+   * one long-running loop that holds a connection and competes with the read
+   * path indefinitely. The bound is what makes a pass's cost predictable.
+   */
+  expirySweepMaxBatches: readInt('EXPIRY_SWEEP_MAX_BATCHES', 20),
 } as const;

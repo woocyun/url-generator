@@ -8,7 +8,7 @@
  * rather than aspirational.
  */
 
-import { eq } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, lte } from 'drizzle-orm';
 import { db } from './client.js';
 import { urlMappings, type NewUrlMapping, type UrlMapping } from './schema.js';
 
@@ -34,6 +34,108 @@ export async function insertMappingIfFree(
     .returning();
 
   return inserted;
+}
+
+/**
+ * Re-creates an expired row in place, if it is still expired and still points
+ * where the caller thinks it does.
+ *
+ * The only statement in this file that overwrites a mapping, and the `where`
+ * clause is what makes that safe rather than a comment saying it is. Three
+ * conditions have to hold at the instant Postgres evaluates them: the code is
+ * the one we mean, its destination is unchanged, and it is past its expiry. A
+ * live link therefore cannot be modified by this statement no matter what
+ * raced ahead of it — the row simply does not match, and the caller gets
+ * `undefined` and treats the code as occupied.
+ *
+ * The destination check is the load-bearing one. An expired row whose
+ * `long_url` is *different* is a hash collision with somebody else's dead link,
+ * and taking its code would point a URL that people are still holding at an
+ * unrelated destination. Those rows are left for the sweep (ADR 0011).
+ *
+ * Every column is written, not just `expires_at`, because this is a creation
+ * rather than an edit: `created_at` is when this mapping began, and the row
+ * would otherwise report the lifetime of the link it replaced. `click_count`
+ * resets for the same reason — Phase 7 is going to read it as this link's
+ * clicks.
+ */
+export async function reviveExpiredMapping(
+  mapping: {
+    shortCode: string;
+    longUrl: string;
+    expiresAt: Date | null;
+    isCustom?: boolean;
+  },
+  now: Date,
+): Promise<UrlMapping | undefined> {
+  const [revived] = await db
+    .update(urlMappings)
+    .set({
+      longUrl: mapping.longUrl,
+      expiresAt: mapping.expiresAt,
+      createdAt: now,
+      clickCount: 0,
+      isCustom: mapping.isCustom ?? false,
+      userId: null,
+    })
+    .where(
+      and(
+        eq(urlMappings.shortCode, mapping.shortCode),
+        eq(urlMappings.longUrl, mapping.longUrl),
+        isNotNull(urlMappings.expiresAt),
+        lte(urlMappings.expiresAt, now),
+      ),
+    )
+    .returning();
+
+  return revived;
+}
+
+/**
+ * Deletes up to `limit` rows that expired before `before`, and says which.
+ *
+ * The sweep's only statement (ADR 0011), and the three things it does beyond
+ * `delete where expires_at <= $1` are each load-bearing:
+ *
+ * `limit` via a sub-select, because `DELETE` takes a row lock per row and holds
+ * it until the statement commits. An unbounded delete against a backlog would
+ * hold thousands of locks on the table the read path is using, for as long as
+ * it took to finish. Batching turns one long statement into many short ones,
+ * and the caller decides how many to run.
+ *
+ * `for update skip locked`, because more than one sweeper is a supported
+ * configuration and a restarted one overlapping its predecessor is a normal
+ * event. Without it the second sweeper blocks on the first's locks and then
+ * deletes rows that are already gone; with it, each takes a disjoint batch and
+ * neither waits.
+ *
+ * `returning`, because the codes are the point. A deleted row that is still in
+ * the cache answers 410 for as long as an hour (`CACHE_TTL_SECONDS`) — the
+ * design's note that the sweep must invalidate what it removes rather than wait
+ * out the TTL. This function reports; `expiry/sweep.ts` invalidates.
+ *
+ * Ordered by `expires_at` so a backlog is worked oldest-first, which keeps
+ * successive batches on the same end of the index and makes the pass's progress
+ * monotonic rather than scattered.
+ */
+export async function deleteExpiredBefore(
+  before: Date,
+  limit: number,
+): Promise<string[]> {
+  const doomed = db
+    .select({ shortCode: urlMappings.shortCode })
+    .from(urlMappings)
+    .where(and(isNotNull(urlMappings.expiresAt), lte(urlMappings.expiresAt, before)))
+    .orderBy(urlMappings.expiresAt)
+    .limit(limit)
+    .for('update', { skipLocked: true });
+
+  const deleted = await db
+    .delete(urlMappings)
+    .where(inArray(urlMappings.shortCode, doomed))
+    .returning({ shortCode: urlMappings.shortCode });
+
+  return deleted.map((row) => row.shortCode);
 }
 
 /**

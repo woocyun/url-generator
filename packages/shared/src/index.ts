@@ -81,6 +81,29 @@ export interface ShortenRequest {
    * characters of `[A-Za-z0-9_-]`, case-sensitive.
    */
   customAlias?: string;
+  /**
+   * How long the link should live, in seconds (F4).
+   *
+   * A duration rather than an instant, because that is what a TTL is and
+   * because the conversion should happen once, on the clock that will later
+   * judge it — a client whose clock is four minutes fast should not be able to
+   * create a link that is already expired. `ShortenResponse.expiresAt` reports
+   * the instant the server computed.
+   *
+   * Three states, and they are different requests:
+   *
+   *   a number   this link lives that many seconds
+   *   `null`     this link never expires, declining any deployment default
+   *   omitted    no opinion; the deployment's default applies, if it has one
+   *
+   * A deployment may cap how long a link can live, in which case both a number
+   * over the cap and `null` are rejected with `invalid_ttl`.
+   *
+   * It applies only to a mapping the request *creates*. A URL that already has
+   * a live link comes back deduplicated with the expiry it was created with —
+   * see `created` below.
+   */
+  expiresIn?: number | null;
 }
 
 /**
@@ -107,6 +130,17 @@ export interface ShortenResponse {
   longUrl: string;
   /** When the mapping was first created — not necessarily by this request. */
   createdAt: string;
+  /**
+   * When the link stops resolving, or `null` if it never does (F4).
+   *
+   * Always the *stored* expiry, which is not necessarily the one this request
+   * asked for. On `created: false` the mapping predates the request and its
+   * lifetime came from whoever created it; a caller who needs a different one
+   * for the same destination asks for a custom alias, which creates a second
+   * mapping. This field is what makes that difference visible instead of
+   * something the client has to assume.
+   */
+  expiresAt: string | null;
   /** False when an identical URL had already been shortened. */
   created: boolean;
   /**

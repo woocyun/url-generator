@@ -24,6 +24,7 @@ Structured as an npm workspace:
 
 ```
 apps/api        Fastify API — shorten, redirect, analytics
+apps/api/src/expiry  The cleanup sweep, run as its own service
 apps/api/drizzle  Generated SQL migrations, applied by the migrate service
 apps/web        Next.js UI
 packages/shared Types shared across the wire
@@ -107,60 +108,95 @@ docker compose exec postgres psql -U urlshortener -d urlshortener
 
 ## Current status
 
-**Phase 5 — custom aliases.** `POST /shorten` takes an optional `customAlias`
-and claims it instead of generating a code
-([ADR 0010](docs/adr/0010-custom-aliases-in-one-namespace.md)).
+**Phase 6 — expiration.** `POST /shorten` takes an optional `expiresIn` in
+seconds, and a periodic sweep deletes links that ran out long enough ago
+([ADR 0011](docs/adr/0011-link-expiry-with-a-retention-window.md)).
 
 ```bash
 curl -s -X POST localhost:4000/shorten \
   -H 'content-type: application/json' \
-  -d '{"url":"https://example.com/launch","customAlias":"launch-notes"}'
+  -d '{"url":"https://example.com/launch","expiresIn":3600}'
 ```
 
 ```json
 {
-  "shortCode": "launch-notes",
-  "shortUrl": "http://localhost:4000/launch-notes",
+  "shortCode": "P8pGiSu",
+  "shortUrl": "http://localhost:4000/P8pGiSu",
   "longUrl": "https://example.com/launch",
-  "createdAt": "2026-08-27T22:55:58.153Z",
+  "createdAt": "2026-08-27T23:35:26.513Z",
+  "expiresAt": "2026-08-28T00:35:26.513Z",
   "created": true,
-  "isCustom": true
+  "isCustom": false
 }
 ```
 
-An alias is a short code in every other respect — same column, same primary key,
-same namespace, same read path. This phase changed no line of the read path and
-needed no migration: `short_code` has been `varchar(32)` and `is_custom` has
-existed since Phase 1.
+**The request is a duration; the response is an instant.** A TTL is naturally a
+duration, and the conversion happens once, on the clock that will later judge
+it — an absolute timestamp measured on a caller's clock and re-judged on ours is
+a link that arrives already expired because a laptop runs four minutes fast.
 
-**The retry is the difference.** A generated code that collides is re-hashed,
-because the caller asked for *a* link and any free code satisfies that. `mylink`
-is the request, so a taken alias is a 409 and there is nothing to retry with.
-The claim itself is the same `INSERT ... ON CONFLICT DO NOTHING` the collision
-loop uses, which is what makes it race-free: twenty concurrent claims on one
-alias with twenty different destinations return one 201 and nineteen 409s, and
-leave one row.
+| `expiresIn` | Meaning |
+| --- | --- |
+| a number | This link lives that many seconds |
+| `null` | Never expires — declining the deployment's default |
+| omitted | No opinion; `DEFAULT_LINK_TTL_SECONDS` applies, if it is set |
+| `0`, `-5`, or over `MAX_LINK_TTL_SECONDS` | `400 invalid_ttl` |
+| `"3600"`, `1.5` | `400 invalid_request` |
+
+Both knobs are unset out of the box, which is every earlier phase's behaviour:
+links are permanent unless asked otherwise. They are different kinds of thing —
+`DEFAULT_LINK_TTL_SECONDS` is a convenience a caller may decline with `null`,
+and `MAX_LINK_TTL_SECONDS` is a policy they may not, so under a ceiling `null`
+is rejected like any other over-long request.
+
+**The read path did not change.** It has refused expired links since Phase 3,
+on a cached copy exactly as on a row, so this phase landed on the write path and
+in a cleanup job. A link expires on schedule even when its cache entry has 59
+minutes left — proven by the log line, where the 410 is served from a cache
+entry written while the link was still alive:
+
+```
+{"shortCode":"5tl1SYx","source":"cache","outcome":"expired","msg":"resolved short code"}
+```
+
+**An expired row is a tombstone, not a deletion.** It is kept for
+`EXPIRY_RETENTION_SECONDS` — a week by default — so `GET /{code}` can answer
+`410 gone` rather than `404`; a crawler that gets 410 drops the URL, one that
+gets 404 keeps retrying. The sweep deletes it afterwards, and the same code
+answers 404 from then on.
+
+That makes "the code is taken" three situations rather than two, and the write
+path has to tell them apart:
 
 | Request | Answer |
 | --- | --- |
-| Alias is free | `201`, `isCustom: true` |
-| Same alias, same destination | `200` — a retried request is not a conflict |
-| Same alias, different destination | `409 alias_taken` |
-| `health`, `login`, `billing`, … | `400 alias_reserved` — never available, so not a 409 |
-| Under 3 chars, over 32, or `my link` | `400 invalid_alias` |
+| Same URL again, any `expiresIn` | `200` with the stored `expiresAt` — a live link is never renewed by re-submission |
+| Same URL after it expired | `201`, the same code, re-created in place |
+| Same alias, same destination, expired | `201` — a renewal |
+| Same alias, different destination, expired | `409 alias_taken` until the sweep |
 
-**Reserved words belong to the namespace, not to the endpoint.**
-`GET /{code}` is the catch-all under the origin, so an alias can shadow a route:
-`GET /shorten` already arrives at the redirect handler as the code `shorten`,
-harmlessly, right up until someone can create that code. The check is
-case-insensitive — `/Login` is as convincing as `/login` to whoever is deciding
-whether to click — and it runs against generated codes too, since `shorten` is
-seven Base62 characters like every code the generator emits.
+A live mapping is never modified. The guard is the `where` clause on the revive
+— still expired, still pointing at the same destination, evaluated by Postgres
+at the instant it runs — rather than the check that precedes it, so no
+interleaving of requests can turn it into an overwrite.
 
-**One URL can now have several codes.** Deduplication was a property of
-derivation (ADR 0003) and a chosen code is not derived, so claiming an alias for
-a URL that already has a generated mapping creates a second one. Both redirect;
-`shortCode` is the identity, and the URL never was.
+**The sweep is storage hygiene, not enforcement.** Nothing about expiry depends
+on it running, which is what makes it safe to batch, to run late, and to fail.
+It runs as its own service rather than a timer inside the API: the API's
+connection pool belongs to the read path, one sweeper is enough however many API
+replicas there are, and a background job you can stop without stopping the API
+is one you can stop during an incident.
 
-The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 6 adds
-expiration.
+```bash
+docker compose logs sweep
+```
+
+To sweep immediately — after inserting test data, or when a takedown needs the
+tombstone gone now:
+
+```bash
+docker compose run --rm sweep npm run db:sweep:once --workspace @url-generator/api
+```
+
+The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 7 adds
+click analytics.

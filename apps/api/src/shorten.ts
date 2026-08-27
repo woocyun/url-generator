@@ -20,13 +20,28 @@
  * claim against the primary key, and no mapping is ever overwritten. What they
  * do not share is the retry, and that difference is the whole of the feature —
  * see `claimAlias`.
+ *
+ * Phase 6 adds a third outcome to the conflict branch that both paths share.
+ * "The code is taken" was two cases — a collision or a re-submission — and
+ * expiry makes it three, because a taken code can now be held by a link that no
+ * longer works. An expired row is a tombstone kept so `GET /{code}` can answer
+ * 410 (ADR 0011), and returning it as `existing` would hand the caller a dead
+ * link with a 200 on it. So a matching expired row is re-created in place
+ * rather than reported, and the caller gets the 201 they asked for. The one
+ * thing that never happens, here or anywhere else in this file, is a *live*
+ * mapping being modified: not its destination, and not its expiry.
  */
 
 import { invalidateCachedTarget } from './cache/redirect-cache.js';
-import { findMappingByCode, insertMappingIfFree } from './db/mappings.js';
+import {
+  findMappingByCode,
+  insertMappingIfFree,
+  reviveExpiredMapping,
+} from './db/mappings.js';
 import type { UrlMapping } from './db/schema.js';
 import { isReservedCode } from './reserved.js';
 import { shortCodeFor } from './short-code.js';
+import { hasExpired } from './ttl.js';
 
 /**
  * How many codes one request will try before giving up.
@@ -55,8 +70,22 @@ export type ShortenOutcome =
  * recognizes it by comparing destinations. There is deliberately no unique
  * index on `long_url` — it would be a second index on the write path, on a
  * 2 KB text column, to enforce something the code derivation already gives us.
+ *
+ * `expiresAt` applies to a mapping this call creates, and only to that. Finding
+ * an existing live mapping returns it untouched — including its expiry, which
+ * may be nothing like the one that was asked for. That is deduplication working
+ * as it always has: the second caller did not create this link and does not get
+ * to change it, because somebody is already holding the version that exists.
+ * The response reports the stored `expiresAt` alongside `created: false`, so
+ * the difference is visible rather than assumed; a caller who needs their own
+ * lifetime for a URL that already has a link asks for a custom alias, which
+ * creates a second mapping (ADR 0010).
  */
-export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> {
+export async function shortenUrl(
+  canonicalUrl: string,
+  expiresAt: Date | null = null,
+  now: Date = new Date(),
+): Promise<ShortenOutcome> {
   const attempted: string[] = [];
 
   for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
@@ -70,7 +99,11 @@ export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> 
     // does for a code somebody else holds.
     if (isReservedCode(shortCode)) continue;
 
-    const inserted = await insertMappingIfFree({ shortCode, longUrl: canonicalUrl });
+    const inserted = await insertMappingIfFree({
+      shortCode,
+      longUrl: canonicalUrl,
+      expiresAt,
+    });
     if (inserted !== undefined) {
       // The code may have been asked for before it existed, and the read path
       // caches that "no such code" answer (ADR 0009). Dropping the entry here
@@ -87,16 +120,39 @@ export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> 
     // conflicted either way.
     const occupant = await findMappingByCode(shortCode);
 
-    // No invalidation on this branch: the row already existed, nothing about
-    // it changed, and whatever the cache holds for the code is still true.
     if (occupant !== undefined && occupant.longUrl === canonicalUrl) {
-      return { outcome: 'existing', mapping: occupant };
+      // No invalidation on this branch: the row already existed, nothing about
+      // it changed, and whatever the cache holds for the code is still true.
+      if (!hasExpired(occupant.expiresAt, now)) {
+        return { outcome: 'existing', mapping: occupant };
+      }
+
+      // The URL's own code, held by its own dead link. Re-create it in place:
+      // the row is a tombstone the sweep has not reached yet (ADR 0011), and
+      // reporting it as `existing` would answer a request to create a link
+      // with a link that does not work.
+      const revived = await reviveExpiredMapping(
+        { shortCode, longUrl: canonicalUrl, expiresAt },
+        now,
+      );
+
+      if (revived !== undefined) {
+        // This one *does* invalidate, and it is the case the cache would
+        // otherwise get wrong for a full hour: the entry says "expired at T",
+        // the row now says otherwise, and unlike a creation there was never a
+        // negative entry here to be harmlessly stale.
+        await invalidateCachedTarget(shortCode);
+
+        return { outcome: 'created', mapping: revived };
+      }
+
+      // Somebody revived or swept it first. Fall through to the next attempt.
     }
 
     // `occupant === undefined` means the row was deleted between the insert and
-    // this read — a Phase 6 expiry sweep, or someone at a psql prompt. Treating
-    // it as a collision rather than retrying the same attempt keeps the loop
-    // bounded; the cost is that the URL settles on its second-choice code.
+    // this read — the expiry sweep, or someone at a psql prompt. Treating it as
+    // a collision rather than retrying the same attempt keeps the loop bounded;
+    // the cost is that the URL settles on its second-choice code.
   }
 
   return { outcome: 'exhausted', attempts: MAX_CODE_ATTEMPTS, codes: attempted };
@@ -145,15 +201,29 @@ export type AliasClaim =
  * pointing where you asked it to point is the outcome you wanted, even in the
  * unlikely case that the row was generated rather than claimed. It is also why
  * `isCustom` is in the response — the mapping you get back can tell you which.
+ *
+ * Expiry splits that third answer in two, and the split is not the same one the
+ * generated path makes. An expired row holding this alias for *your*
+ * destination is your own dead link, and re-claiming it is a renewal: it comes
+ * back 201, re-created in place. An expired row holding it for someone else's
+ * destination is still a 409, even though the link behind it no longer works —
+ * because an alias is a name, the name is still spelled the same, and handing
+ * `launch-notes` to a second destination while the first one's URL is in
+ * circulation would silently redirect people who followed a link somebody else
+ * sent them. The alias comes free when the sweep deletes the row (ADR 0011),
+ * which is one of the things the retention window is trading against.
  */
 export async function claimAlias(
   alias: string,
   canonicalUrl: string,
+  expiresAt: Date | null = null,
+  now: Date = new Date(),
 ): Promise<AliasClaim> {
   for (let attempt = 0; attempt < ALIAS_CLAIM_ATTEMPTS; attempt += 1) {
     const inserted = await insertMappingIfFree({
       shortCode: alias,
       longUrl: canonicalUrl,
+      expiresAt,
       isCustom: true,
     });
 
@@ -169,12 +239,28 @@ export async function claimAlias(
     const occupant = await findMappingByCode(alias);
 
     if (occupant !== undefined) {
-      return occupant.longUrl === canonicalUrl
-        ? { outcome: 'existing', mapping: occupant }
-        : { outcome: 'taken' };
+      // Somebody else's link, live or expired. See above for why the expired
+      // case is still a conflict.
+      if (occupant.longUrl !== canonicalUrl) return { outcome: 'taken' };
+
+      if (!hasExpired(occupant.expiresAt, now)) {
+        return { outcome: 'existing', mapping: occupant };
+      }
+
+      const revived = await reviveExpiredMapping(
+        { shortCode: alias, longUrl: canonicalUrl, expiresAt, isCustom: true },
+        now,
+      );
+
+      if (revived !== undefined) {
+        await invalidateCachedTarget(alias);
+
+        return { outcome: 'created', mapping: revived };
+      }
     }
 
-    // The row was deleted between the insert and this read. Go around once.
+    // The row was deleted between the insert and this read, or somebody won the
+    // revive. Go around once.
   }
 
   return { outcome: 'taken' };

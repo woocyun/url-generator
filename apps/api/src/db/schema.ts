@@ -9,6 +9,7 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   boolean,
+  index,
   pgTable,
   text,
   timestamp,
@@ -59,8 +60,10 @@ export const urlMappings = pgTable('url_mappings', {
     .defaultNow(),
 
   /**
-   * NULL means the link never expires. Phase 6 adds the passive expiry check
-   * and the index that makes the cleanup sweep cheap.
+   * NULL means the link never expires (F4). Set on the write path from the
+   * caller's `expiresIn` or the deployment's default (`ttl.ts`), read by
+   * `redirect.ts` on every resolution, and by the sweep that eventually deletes
+   * the row. Never updated for a live link — see ADR 0011.
    */
   expiresAt: timestamp('expires_at', { withTimezone: true }),
 
@@ -82,7 +85,26 @@ export const urlMappings = pgTable('url_mappings', {
    * destination. Phase 7 splits click statistics on it.
    */
   isCustom: boolean('is_custom').notNull().default(false),
-});
+},
+(table) => [
+  /**
+   * The second index on this table, and the first one that is not the primary
+   * key. It exists for exactly one query: the sweep's "which rows expired
+   * before this instant" (`deleteExpiredBefore`). Design §6 deferred it to
+   * this phase deliberately, so that no index sat here without a caller.
+   *
+   * Partial, on `expires_at is not null`, and that is the whole reason it is
+   * affordable. Permanent links are the common case — the default TTL is unset
+   * unless a deployment opts in — and a full index would carry a NULL entry for
+   * every one of them: dead weight in the index, and a write-path cost on the
+   * 115 inserts a second design §2 budgets for. The partial index is
+   * proportional to the number of links that can actually expire, and rows
+   * that will never interest the sweep are not in it at all.
+   */
+  index('url_mappings_expires_at_idx')
+    .on(table.expiresAt)
+    .where(sql`${table.expiresAt} is not null`),
+]);
 
 export type UrlMapping = typeof urlMappings.$inferSelect;
 export type NewUrlMapping = typeof urlMappings.$inferInsert;

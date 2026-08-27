@@ -14,6 +14,7 @@ import { apiError } from '../errors.js';
 import { env } from '../env.js';
 import { claimAlias, shortenUrl } from '../shorten.js';
 import type { UrlMapping } from '../db/schema.js';
+import { resolveExpiry } from '../ttl.js';
 import { canonicalizeUrl, MAX_URL_LENGTH } from '../url.js';
 
 /**
@@ -29,9 +30,16 @@ import { canonicalizeUrl, MAX_URL_LENGTH } from '../url.js';
  * `invalid_request` for a 2-character alias, our `invalid_alias` for one
  * containing a slash. One place decides, and it is the place that can say why.
  *
- * `additionalProperties: false` because a request carrying `expiresAt` today is
- * a client written against a phase that does not exist yet, and silently
- * dropping the field would let it believe otherwise.
+ * `additionalProperties: false` because a request carrying a field from a phase
+ * that does not exist yet is a client with a wrong idea about this API, and
+ * silently dropping the field would let it keep the idea.
+ *
+ * `expiresIn` follows `customAlias`: the schema checks the *type*, and every
+ * bound lives in `resolveExpiry` (`ttl.ts`). The type check has to be here — it is the one
+ * thing ajv can enforce that the domain cannot recover, since `coerceTypes` is
+ * off and `"3600"` must be a rejection rather than an hour — while `null` is
+ * declared as an accepted type because it is a meaningful request ("never
+ * expires") and not a missing field.
  */
 const shortenBodySchema = {
   type: 'object',
@@ -40,6 +48,7 @@ const shortenBodySchema = {
   properties: {
     url: { type: 'string', minLength: 1, maxLength: MAX_URL_LENGTH },
     customAlias: { type: 'string' },
+    expiresIn: { type: ['integer', 'null'] },
   },
 } as const;
 
@@ -61,6 +70,10 @@ function sendMapping(
     shortUrl: `${env.publicBaseUrl}/${mapping.shortCode}`,
     longUrl: mapping.longUrl,
     createdAt: mapping.createdAt.toISOString(),
+    // Read off the mapping rather than off the request, which is the whole
+    // point of it being in the response: on a 200 this is the expiry the link
+    // already had, and it may be nothing like the one that was asked for.
+    expiresAt: mapping.expiresAt === null ? null : mapping.expiresAt.toISOString(),
     created,
     isCustom: mapping.isCustom,
   };
@@ -83,6 +96,17 @@ export async function shortenRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send(apiError(canonical.code, canonical.message));
       }
 
+      // Before any database work, and before the alias branch, because a TTL is
+      // a fact about the request that both paths need and neither should decide
+      // twice. `resolveExpiry` is also where the deployment's default is
+      // applied, so from here down a `null` expiry means "permanent" and never
+      // "nobody has decided yet".
+      const expiry = resolveExpiry(request.body.expiresIn);
+
+      if (!expiry.ok) {
+        return reply.code(400).send(apiError(expiry.code, expiry.message));
+      }
+
       const requested = request.body.customAlias;
 
       if (requested !== undefined) {
@@ -94,7 +118,7 @@ export async function shortenRoutes(app: FastifyInstance): Promise<void> {
           return reply.code(400).send(apiError(alias.code, alias.message));
         }
 
-        const claim = await claimAlias(alias.alias, canonical.url);
+        const claim = await claimAlias(alias.alias, canonical.url, expiry.expiresAt);
 
         // 409 rather than 400, and the difference is the one the client acts
         // on. A reserved alias will never be available and the client should
@@ -115,7 +139,7 @@ export async function shortenRoutes(app: FastifyInstance): Promise<void> {
         return sendMapping(reply, claim.mapping, claim.outcome === 'created');
       }
 
-      const result = await shortenUrl(canonical.url);
+      const result = await shortenUrl(canonical.url, expiry.expiresAt);
 
       if (result.outcome === 'exhausted') {
         // Loud, per ADR 0003: exhausting the retry budget means the collision

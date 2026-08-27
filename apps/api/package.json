@@ -9,6 +9,8 @@
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts",
+    "db:sweep": "tsx src/expiry/run.ts",
+    "db:sweep:once": "tsx src/expiry/run.ts --once",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
