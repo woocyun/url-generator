@@ -33,10 +33,10 @@ import {
  */
 export const urlMappings = pgTable('url_mappings', {
   /**
-   * Base62 code from the URL path. Generated codes are 7 characters (ADR 0003);
-   * the column is wider to leave room for the custom aliases Phase 5 adds,
-   * which is also where the permitted character set and reserved words get
-   * settled.
+   * Base62 code from the URL path. Generated codes are 7 characters (ADR 0003),
+   * and the column is wider because custom aliases share this namespace: 3 to
+   * 32 characters of `[A-Za-z0-9_-]`, case-sensitive like everything else here
+   * (ADR 0010). One column, one primary key, one uniqueness rule.
    */
   shortCode: varchar('short_code', { length: 32 }).primaryKey(),
 
@@ -74,9 +74,12 @@ export const urlMappings = pgTable('url_mappings', {
     .default(sql`0`),
 
   /**
-   * Distinguishes a user-chosen alias from a generated code. Collision retries
-   * (Phase 2) may re-generate a code; a custom alias must never be silently
-   * replaced, so the two cases have to be tellable apart.
+   * Distinguishes a user-chosen alias from a generated code (ADR 0010). Set on
+   * the claim and never updated: once both are rows in one namespace, this is
+   * the only thing that tells them apart, and it is on the wire for the same
+   * reason — a caller that asked for an alias and got `created: false,
+   * isCustom: false` collided with a generated mapping for the same
+   * destination. Phase 7 splits click statistics on it.
    */
   isCustom: boolean('is_custom').notNull().default(false),
 });

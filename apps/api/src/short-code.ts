@@ -105,18 +105,20 @@ export function shortCodeFor(canonicalUrl: string, attempt = 0): string {
  * The widest string the read path will take to the database.
  *
  * It is the `short_code` column's width (design §6), not the generated code
- * length: Phase 5's custom aliases share this namespace, and a lookup that
- * rejected anything longer than seven characters would have to be revisited
- * the moment they land.
+ * length: custom aliases share this namespace, and a lookup that rejected
+ * anything longer than seven characters would have to be revisited the moment
+ * they land. Exported because `alias.ts` bounds a chosen code by the same
+ * column rather than by a second number that could drift from it.
  */
-const MAX_SHORT_CODE_LENGTH = 32;
+export const MAX_SHORT_CODE_LENGTH = 32;
 
 /**
- * Base62, plus the two separators a custom alias will plausibly want.
+ * Base62, plus the two separators a custom alias wants.
  *
- * Deliberately looser than what `shortCodeFor` emits. Phase 5 settles the alias
- * charset and its reserved words; this pattern only has to be a superset of
- * both, because its job is not validation.
+ * Deliberately looser than what `shortCodeFor` emits, and now a strict superset
+ * of what `alias.ts` accepts as well — which is why Phase 5 landed without
+ * touching the read path at all. Its job is not validation: it is the shape
+ * test that keeps `/favicon.ico` off the database.
  */
 const SHORT_CODE_PATTERN = new RegExp(`^[0-9A-Za-z_-]{1,${MAX_SHORT_CODE_LENGTH}}$`);
 

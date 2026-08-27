@@ -28,9 +28,9 @@ const app = Fastify({
   //                    canonicalizes to https://0.0.0.42/ — a request that was
   //                    plainly malformed becomes a stored mapping.
   //   removeAdditional silently deletes properties the schema does not declare,
-  //                    so a client sending `customAlias` before Phase 5 exists
-  //                    gets a 201 and a generated code, and no hint that the
-  //                    field went in the bin.
+  //                    so a client sending `expiresAt` before Phase 6 exists
+  //                    gets a 201 and a link that never expires, and no hint
+  //                    that the field went in the bin.
   //
   // Both defaults trade a clear rejection for a plausible-looking wrong answer.
   ajv: {

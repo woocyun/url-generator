@@ -13,11 +13,12 @@
  * harmless, because a mapping stored under that code resolves normally.
  *
  * The namespaces do overlap, though. Generated codes are seven Base62
- * characters, and `shorten` is seven Base62 characters. Nothing collides today
- * — a route and a code can share a spelling as long as they never share a
- * method — but Phase 5 lets a user *choose* an alias, at which point `health`
- * becomes claimable and would shadow the endpoint. That is why reserved words
- * are in Phase 5's scope and not deferred past it.
+ * characters, and `shorten` is seven Base62 characters. A route and a code can
+ * share a spelling as long as they never share a method — but since Phase 5 a
+ * user can *choose* a code, which would make `health` claimable and let it
+ * shadow the endpoint. `reserved.ts` is what closes that, on the write path
+ * rather than here: this route's job is to resolve whatever is in the table,
+ * and keeping the wrong things out of the table is the write path's.
  */
 
 import type { FastifyInstance } from 'fastify';

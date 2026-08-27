@@ -71,6 +71,16 @@ export interface ApiError {
  */
 export interface ShortenRequest {
   url: string;
+  /**
+   * A code to claim instead of generating one (F3).
+   *
+   * Optional, and omitting it is the ordinary path. Supplying it changes the
+   * failure modes rather than the shape of the answer: an alias can be
+   * malformed or reserved (400), or already held by a different destination
+   * (409), where a generated code simply retries past a collision. 3–32
+   * characters of `[A-Za-z0-9_-]`, case-sensitive.
+   */
+  customAlias?: string;
 }
 
 /**
@@ -82,6 +92,11 @@ export interface ShortenRequest {
  * about it: `createdAt` may be older than the request, and the status code says
  * which happened — 201 for a mapping this request created, 200 for one that
  * already existed.
+ *
+ * Deduplication is a property of the *generated* path only. A custom alias is a
+ * second name for a destination that may already have one, so one URL can have
+ * any number of codes once F3 is in play — which is why `shortCode` is the
+ * identity here and the URL is not.
  */
 export interface ShortenResponse {
   /** Base62 code that identifies the mapping. */
@@ -94,4 +109,13 @@ export interface ShortenResponse {
   createdAt: string;
   /** False when an identical URL had already been shortened. */
   created: boolean;
+  /**
+   * True when the code was chosen by a caller rather than derived from the URL.
+   *
+   * Worth having on the wire because `created: false` alone does not say what
+   * you collided with: an alias request that comes back `created: false,
+   * isCustom: false` matched a generated mapping that already pointed at the
+   * same destination.
+   */
+  isCustom: boolean;
 }

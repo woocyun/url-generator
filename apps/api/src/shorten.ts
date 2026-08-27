@@ -13,11 +13,19 @@
  *   existing  — the URL was already shortened; the same code comes back
  *   exhausted — every attempt collided, which is a 500 and an alert, never a
  *               silently duplicated or overwritten mapping
+ *
+ * Phase 5 adds the second way in — `claimAlias`, where the caller brings the
+ * code instead of deriving it. It shares this file rather than getting its own
+ * because both are the same operation with the same guarantee: one atomic
+ * claim against the primary key, and no mapping is ever overwritten. What they
+ * do not share is the retry, and that difference is the whole of the feature —
+ * see `claimAlias`.
  */
 
 import { invalidateCachedTarget } from './cache/redirect-cache.js';
 import { findMappingByCode, insertMappingIfFree } from './db/mappings.js';
 import type { UrlMapping } from './db/schema.js';
+import { isReservedCode } from './reserved.js';
 import { shortCodeFor } from './short-code.js';
 
 /**
@@ -55,6 +63,13 @@ export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> 
     const shortCode = shortCodeFor(canonicalUrl, attempt);
     attempted.push(shortCode);
 
+    // A generated code is seven Base62 characters and so is `shorten`, so the
+    // reserved list is a property of the namespace rather than of the alias
+    // endpoint (`reserved.ts`). One in 3.5 trillion, and the fix is to treat it
+    // as occupied and re-hash past it — which is what the loop below already
+    // does for a code somebody else holds.
+    if (isReservedCode(shortCode)) continue;
+
     const inserted = await insertMappingIfFree({ shortCode, longUrl: canonicalUrl });
     if (inserted !== undefined) {
       // The code may have been asked for before it existed, and the read path
@@ -85,4 +100,82 @@ export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> 
   }
 
   return { outcome: 'exhausted', attempts: MAX_CODE_ATTEMPTS, codes: attempted };
+}
+
+/**
+ * How many times a claim will re-try an alias that vanished under it.
+ *
+ * Not a collision retry — there is nothing to retry a chosen code *with*. This
+ * covers one narrow race: the insert conflicts, and by the time we read the
+ * occupant to find out who holds the code, the row is gone (a Phase 6 sweep, a
+ * takedown, someone at a psql prompt). Reporting "taken" there would be a false
+ * negative about a code that is free, so we go around once more; twice is
+ * enough, because a caller losing this race twice is indistinguishable from a
+ * caller who is genuinely too late.
+ */
+const ALIAS_CLAIM_ATTEMPTS = 2;
+
+export type AliasClaim =
+  | { outcome: 'created'; mapping: UrlMapping }
+  | { outcome: 'existing'; mapping: UrlMapping }
+  | { outcome: 'taken' };
+
+/**
+ * Claims `alias` for `canonicalUrl`, if it is free.
+ *
+ * The atomic primitive is the one the generated path already uses —
+ * `INSERT ... ON CONFLICT DO NOTHING` against the primary key (design §6) — and
+ * it is what makes the claim race-free without a lock or a transaction. The
+ * read-then-insert alternative has a window in which two requests both see the
+ * alias free, and the loser of that race silently overwrites a link the winner
+ * has already handed out. Here the loser gets an empty result and is told the
+ * alias is taken, which is the truth.
+ *
+ * What differs from `shortenUrl` is what happens on conflict, and it is not an
+ * omission that there is no retry loop: a generated code that collides can be
+ * re-derived, because the user did not ask for that string — they asked for *a*
+ * link. An alias that collides cannot. `mylink` is the request, and the only
+ * honest answers are "you have it" and "somebody else does".
+ *
+ * The third answer is `existing`, and it is what makes a retried request safe.
+ * The same alias for the same destination is the request that was already
+ * satisfied — by an earlier attempt whose response was lost, or by the same
+ * user clicking twice — so it succeeds rather than reporting a conflict with
+ * itself. Note the test is the *destination*, not who created the row: an alias
+ * pointing where you asked it to point is the outcome you wanted, even in the
+ * unlikely case that the row was generated rather than claimed. It is also why
+ * `isCustom` is in the response — the mapping you get back can tell you which.
+ */
+export async function claimAlias(
+  alias: string,
+  canonicalUrl: string,
+): Promise<AliasClaim> {
+  for (let attempt = 0; attempt < ALIAS_CLAIM_ATTEMPTS; attempt += 1) {
+    const inserted = await insertMappingIfFree({
+      shortCode: alias,
+      longUrl: canonicalUrl,
+      isCustom: true,
+    });
+
+    if (inserted !== undefined) {
+      // Same reason as the generated path: the read path caches "no such code"
+      // (ADR 0009), and an alias is far more likely than a generated code to
+      // have been tried before it existed — a chosen name is one people guess.
+      await invalidateCachedTarget(alias);
+
+      return { outcome: 'created', mapping: inserted };
+    }
+
+    const occupant = await findMappingByCode(alias);
+
+    if (occupant !== undefined) {
+      return occupant.longUrl === canonicalUrl
+        ? { outcome: 'existing', mapping: occupant }
+        : { outcome: 'taken' };
+    }
+
+    // The row was deleted between the insert and this read. Go around once.
+  }
+
+  return { outcome: 'taken' };
 }

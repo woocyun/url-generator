@@ -107,47 +107,60 @@ docker compose exec postgres psql -U urlshortener -d urlshortener
 
 ## Current status
 
-**Phase 4 — Redis on the read path.** `GET /{code}` now resolves from a
-cache-aside lookup: Redis first, Postgres on a miss, and the result written
-back ([ADR 0009](docs/adr/0009-redis-cache-aside-on-the-read-path.md)).
+**Phase 5 — custom aliases.** `POST /shorten` takes an optional `customAlias`
+and claims it instead of generating a code
+([ADR 0010](docs/adr/0010-custom-aliases-in-one-namespace.md)).
 
 ```bash
-curl -s localhost:4000/health | jq .dependencies.cache
+curl -s -X POST localhost:4000/shorten \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/launch","customAlias":"launch-notes"}'
 ```
 
 ```json
-{ "status": "ok", "latencyMs": 1 }
+{
+  "shortCode": "launch-notes",
+  "shortUrl": "http://localhost:4000/launch-notes",
+  "longUrl": "https://example.com/launch",
+  "createdAt": "2026-08-27T22:55:58.153Z",
+  "created": true,
+  "isCustom": true
+}
 ```
 
-**The cache is never a dependency.** Unreachable, slow, or empty all reach the
-read path as a miss — which is exactly Phase 3's behaviour. Stopping Redis
-outright leaves redirects answering in ~3 ms, writes working, and `/health`
-reporting `degraded` while still returning 200; the API reconnects on its own.
-That is the point of the phase: N1 asks for 99.99% on the redirect path, and a
-cache that can take that path down with it would be a net loss no matter how
-many round-trips it saved.
+An alias is a short code in every other respect — same column, same primary key,
+same namespace, same read path. This phase changed no line of the read path and
+needed no migration: `short_code` has been `varchar(32)` and `is_custom` has
+existed since Phase 1.
 
-| | p50 | p99 |
-| --- | --- | --- |
-| Postgres lookup (Phase 3) | 0.156 ms | 0.588 ms |
-| Redis lookup | 0.052 ms | 0.086 ms |
-| `GET /{code}` end to end | 2.38 ms | 5.56 ms |
+**The retry is the difference.** A generated code that collides is re-hashed,
+because the caller asked for *a* link and any free code satisfies that. `mylink`
+is the request, so a taken alias is a 409 and there is nothing to retry with.
+The claim itself is the same `INSERT ... ON CONFLICT DO NOTHING` the collision
+loop uses, which is what makes it race-free: twenty concurrent claims on one
+alias with twenty different destinations return one 201 and nineteen 409s, and
+leave one row.
 
-Which is the honest reading: at this scale the cache is not what makes the
-redirect fast — it already was, and the 50 ms budget is spent on HTTP, not on
-the lookup. What changes is the slope. Every hit is a query Postgres does not
-run, so read capacity stops being bounded by one database's connection pool.
+| Request | Answer |
+| --- | --- |
+| Alias is free | `201`, `isCustom: true` |
+| Same alias, same destination | `200` — a retried request is not a conflict |
+| Same alias, different destination | `409 alias_taken` |
+| `health`, `login`, `billing`, … | `400 alias_reserved` — never available, so not a 409 |
+| Under 3 chars, over 32, or `my link` | `400 invalid_alias` |
 
-**Misses are cached too**, for 30 seconds. `/{code}` is the catch-all under the
-origin, so without a negative entry a scanner walking seven-character strings
-costs one Postgres round-trip per guess. The write path deletes the entry when
-it creates a code, and the short TTL bounds the cases where that delete cannot
-help.
+**Reserved words belong to the namespace, not to the endpoint.**
+`GET /{code}` is the catch-all under the origin, so an alias can shadow a route:
+`GET /shorten` already arrives at the redirect handler as the code `shorten`,
+harmlessly, right up until someone can create that code. The check is
+case-insensitive — `/Login` is as convincing as `/login` to whoever is deciding
+whether to click — and it runs against generated codes too, since `shorten` is
+seven Base62 characters like every code the generator emits.
 
-Expiry and the destination check stay in the application, above the cache, so
-a link expires on schedule even when its entry has 59 minutes of TTL left, and
-a planted `javascript:` destination is refused on the cached path exactly as on
-the uncached one.
+**One URL can now have several codes.** Deduplication was a property of
+derivation (ADR 0003) and a chosen code is not derived, so claiming an alias for
+a URL that already has a generated mapping creates a second one. Both redirect;
+`shortCode` is the identity, and the URL never was.
 
-The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 5 adds
-custom aliases.
+The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 6 adds
+expiration.
