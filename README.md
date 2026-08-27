@@ -89,30 +89,38 @@ docker compose exec postgres psql -U urlshortener -d urlshortener
 
 ## Current status
 
-**Phase 2 — `POST /shorten`.** The write path works end to end: a URL is
-canonicalized, hashed with SHA-256, truncated, and Base62-encoded into a
-7-character code, then claimed with a single `INSERT ... ON CONFLICT DO NOTHING`
-([ADR 0007](docs/adr/0007-sha256-truncated-to-seven-base62-characters.md)).
+**Phase 3 — `GET /{code}`.** The loop closes: a link created by `POST /shorten`
+now resolves. The `shortUrl` from Phase 2 is a working link rather than a
+promise.
 
 ```bash
-curl -X POST localhost:4000/shorten -H 'content-type: application/json' -d '{"url":"https://example.com/some/very/long/path?a=1"}'
+curl -i localhost:4000/wYx0ePz
 ```
 
-```json
-{
-  "shortCode": "wYx0ePz",
-  "shortUrl": "http://localhost:4000/wYx0ePz",
-  "longUrl": "https://example.com/some/very/long/path?a=1",
-  "createdAt": "2026-08-27T01:28:00.220Z",
-  "created": true
-}
+```
+HTTP/1.1 302 Found
+location: https://example.com/some/very/long/path?a=1
+cache-control: no-store
 ```
 
-Codes are derived from the URL rather than allocated, so shortening the same
-destination twice returns the same code and stores one row — the response says
-so with `created: false` and a 200 instead of a 201. Two different URLs that
-hash to the same code are resolved by re-hashing with the attempt number, up to
-five times; exhausting that is a 500, never a silent duplicate.
+**302, not 301**, and nothing this route returns is cacheable
+([ADR 0008](docs/adr/0008-302-redirects-with-no-store-and-410-for-expired-links.md)).
+A 301 is faster for a repeat visitor exactly because the browser stops
+contacting us — and a link we never see again is one we cannot count, expire, or
+take down. The round-trip is what buys the link's lifecycle back, and it is
+cheap: a primary-key lookup on two columns, p50 0.53 ms / p99 1.41 ms locally
+against the design's 50 ms budget.
 
-`GET /{code}` does not exist yet, so the `shortUrl` above is a promise Phase 3
-keeps. The full roadmap is in [docs/design.md](docs/design.md#7-roadmap).
+An unknown code is a `404`; a code that resolves to a link past its expiry is a
+`410`, because a crawler that gets a 410 drops the URL while one that gets a 404
+keeps retrying. The expiry branch is live but unreachable through the public API
+until Phase 6 starts setting `expires_at` — the read path honours the column
+before the write path fills it.
+
+Paths that cannot be short codes (`/favicon.ico`, `/robots.txt`, a scanner
+walking a wordlist) are answered from their shape without touching Postgres, so
+the hot path's round-trips track real traffic rather than whatever points at the
+origin.
+
+The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 4 puts
+a Redis cache in front of this lookup.

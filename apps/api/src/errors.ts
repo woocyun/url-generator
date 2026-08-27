@@ -17,8 +17,10 @@ import type { ApiError } from '@url-generator/shared';
 export const ErrorCode = {
   /** Body was missing, malformed, or failed schema validation. */
   INVALID_REQUEST: 'invalid_request',
-  /** No route matched. */
+  /** No route matched, or no such short code. */
   NOT_FOUND: 'not_found',
+  /** The short code resolved, but the link it names is past its expiry. */
+  LINK_EXPIRED: 'link_expired',
   /** Something failed that the client cannot do anything about. */
   INTERNAL_ERROR: 'internal_error',
 } as const;

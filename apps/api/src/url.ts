@@ -100,3 +100,26 @@ export function canonicalizeUrl(input: string): CanonicalizeResult {
 
   return { ok: true, url: canonical };
 }
+
+/**
+ * Whether a stored destination is safe to put in a `Location` header.
+ *
+ * `canonicalizeUrl` already rejects everything that is not http(s) on the way
+ * in, so on paper this can never fail. It runs anyway because the consequence
+ * of being wrong is a redirect gadget with our origin's name on it, and the
+ * write path is not the only thing that can reach the table — a migration, a
+ * restored backup, or someone at a psql prompt can all put a row there without
+ * passing through the canonicalizer.
+ *
+ * A cheap check on the read path is what keeps "the API never emits a
+ * `javascript:` Location" a property of the API rather than a property of one
+ * code path in it.
+ */
+export function isRedirectableUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}

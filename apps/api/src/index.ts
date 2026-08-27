@@ -12,6 +12,7 @@ import { closeDatabase } from './db/client.js';
 import { env } from './env.js';
 import { registerErrorHandlers } from './errors.js';
 import { healthRoutes } from './routes/health.js';
+import { redirectRoutes } from './routes/redirect.js';
 import { shortenRoutes } from './routes/shorten.js';
 
 const app = Fastify({
@@ -43,6 +44,10 @@ registerErrorHandlers(app);
 
 await app.register(healthRoutes);
 await app.register(shortenRoutes);
+
+// Last: `/:code` is the catch-all under `/`, so every route registered after it
+// would be a short code taken out of circulation.
+await app.register(redirectRoutes);
 
 async function start(): Promise<void> {
   try {

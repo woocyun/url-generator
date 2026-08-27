@@ -100,3 +100,40 @@ export function shortCodeFor(canonicalUrl: string, attempt = 0): string {
 
   return encodeBase62(truncated % CODE_SPACE);
 }
+
+/**
+ * The widest string the read path will take to the database.
+ *
+ * It is the `short_code` column's width (design §6), not the generated code
+ * length: Phase 5's custom aliases share this namespace, and a lookup that
+ * rejected anything longer than seven characters would have to be revisited
+ * the moment they land.
+ */
+const MAX_SHORT_CODE_LENGTH = 32;
+
+/**
+ * Base62, plus the two separators a custom alias will plausibly want.
+ *
+ * Deliberately looser than what `shortCodeFor` emits. Phase 5 settles the alias
+ * charset and its reserved words; this pattern only has to be a superset of
+ * both, because its job is not validation.
+ */
+const SHORT_CODE_PATTERN = new RegExp(`^[0-9A-Za-z_-]{1,${MAX_SHORT_CODE_LENGTH}}$`);
+
+/**
+ * Whether `value` could be a short code at all.
+ *
+ * This is an optimization, not validation, and the distinction decides the
+ * status code. Every path under the API's origin that is not a declared route
+ * reaches the redirect handler — `/favicon.ico`, `/robots.txt`, `/.env`, a
+ * crawler's guesses — and none of them can be a code. Answering them from the
+ * pattern keeps the hot path's database round-trips proportional to real
+ * traffic rather than to what points at the origin.
+ *
+ * Because it is not validation, a string that fails here gets the same 404 as a
+ * code that is merely unknown: to whoever followed the link, both are "no such
+ * link", and a 400 would be blaming the client for a URL it did not compose.
+ */
+export function looksLikeShortCode(value: string): boolean {
+  return SHORT_CODE_PATTERN.test(value);
+}
