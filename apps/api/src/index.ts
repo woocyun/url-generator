@@ -1,44 +1,48 @@
+/**
+ * API entry point: build the server, mount the routes, run it.
+ *
+ * Routes live in `routes/` and are registered here. The split is not
+ * housekeeping — design §3 keeps the write path and the read path separable so
+ * that running them as two services later is a configuration change rather than
+ * a rewrite, and that only stays true if they never grow into each other.
+ */
+
 import Fastify from 'fastify';
-import type { HealthResponse } from '@url-generator/shared';
-import { checkDatabase, closeDatabase } from './db/client.js';
+import { closeDatabase } from './db/client.js';
 import { env } from './env.js';
-
-const SERVICE_NAME = 'url-generator-api';
-const VERSION = '0.1.0';
-
-const startedAt = Date.now();
+import { registerErrorHandlers } from './errors.js';
+import { healthRoutes } from './routes/health.js';
+import { shortenRoutes } from './routes/shorten.js';
 
 const app = Fastify({
   logger: {
     level: env.nodeEnv === 'production' ? 'info' : 'debug',
   },
-});
 
-/**
- * Liveness probe, plus the state of everything the API depends on.
- *
- * Always answers 200 while the process can serve a request. A database outage
- * shows up as `status: 'degraded'` in the body rather than as a failed probe,
- * because restarting the API would not fix Postgres and would only take the
- * cached read path (Phase 4) down with it.
- */
-app.get('/health', async (): Promise<HealthResponse> => {
-  const database = await checkDatabase();
-
-  return {
-    status: database.reachable ? 'ok' : 'degraded',
-    service: SERVICE_NAME,
-    version: VERSION,
-    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-    dependencies: {
-      database: {
-        status: database.reachable ? 'ok' : 'unreachable',
-        latencyMs: database.latencyMs,
-        ...(database.error === undefined ? {} : { error: database.error }),
-      },
+  // Two of Fastify's ajv defaults are wrong for an API whose input is a URL
+  // someone will paste from anywhere.
+  //
+  //   coerceTypes      turns `{"url": 42}` into the string "42", which then
+  //                    canonicalizes to https://0.0.0.42/ — a request that was
+  //                    plainly malformed becomes a stored mapping.
+  //   removeAdditional silently deletes properties the schema does not declare,
+  //                    so a client sending `customAlias` before Phase 5 exists
+  //                    gets a 201 and a generated code, and no hint that the
+  //                    field went in the bin.
+  //
+  // Both defaults trade a clear rejection for a plausible-looking wrong answer.
+  ajv: {
+    customOptions: {
+      coerceTypes: false,
+      removeAdditional: false,
     },
-  };
+  },
 });
+
+registerErrorHandlers(app);
+
+await app.register(healthRoutes);
+await app.register(shortenRoutes);
 
 async function start(): Promise<void> {
   try {

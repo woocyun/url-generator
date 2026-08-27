@@ -24,6 +24,23 @@ function readRequired(name: string): string {
   return raw;
 }
 
+/**
+ * Reads an origin the outside world can reach us on, with the trailing slash
+ * normalized away so callers can join paths with a plain `/`.
+ */
+function readBaseUrl(name: string, fallback: string): string {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+
+  try {
+    new URL(raw);
+  } catch {
+    throw new Error(`${name} must be an absolute url, got: ${raw}`);
+  }
+
+  return raw.replace(/\/+$/, '');
+}
+
 function readInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -53,4 +70,19 @@ export const env = {
    * and a `psql` session for whoever is debugging.
    */
   databasePoolMax: readInt('DATABASE_POOL_MAX', 10),
+
+  /**
+   * The origin short links are handed out under, used to build the `shortUrl`
+   * in a create response. It is configuration rather than something derived
+   * from the request's `Host` header: behind a proxy that header is
+   * attacker-controlled, and a shortener that will mint links pointing at
+   * whatever host a caller claims is a redirect gadget.
+   *
+   * Defaults to the API's own local port, because the API is what serves
+   * `GET /{code}` from Phase 3.
+   */
+  publicBaseUrl: readBaseUrl(
+    'PUBLIC_BASE_URL',
+    `http://localhost:${readPort('API_PORT', 4000)}`,
+  ),
 } as const;

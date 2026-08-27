@@ -43,3 +43,37 @@ export interface ApiError {
   code: string;
   message: string;
 }
+
+/**
+ * Request body of `POST /shorten`.
+ *
+ * `url` is the raw destination as the user typed it. The API canonicalizes it
+ * before hashing, so the value stored and returned may differ from what was
+ * sent — see `ShortenResponse.longUrl`.
+ */
+export interface ShortenRequest {
+  url: string;
+}
+
+/**
+ * Response body of `POST /shorten`.
+ *
+ * Short codes are derived from the URL rather than allocated (ADR 0003), so
+ * submitting the same destination twice returns the same code and stores one
+ * row. That makes deduplication observable, and the contract has to be explicit
+ * about it: `createdAt` may be older than the request, and the status code says
+ * which happened — 201 for a mapping this request created, 200 for one that
+ * already existed.
+ */
+export interface ShortenResponse {
+  /** Base62 code that identifies the mapping. */
+  shortCode: string;
+  /** The full short URL, built from the API's public base URL. */
+  shortUrl: string;
+  /** The canonicalized destination, which is what a redirect will send to. */
+  longUrl: string;
+  /** When the mapping was first created — not necessarily by this request. */
+  createdAt: string;
+  /** False when an identical URL had already been shortened. */
+  created: boolean;
+}

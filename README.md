@@ -89,24 +89,30 @@ docker compose exec postgres psql -U urlshortener -d urlshortener
 
 ## Current status
 
-**Phase 1 — data layer.** The `url_mappings` table exists, migrations are
-generated and applied by a dedicated job, and `/health` reports the database it
-depends on:
+**Phase 2 — `POST /shorten`.** The write path works end to end: a URL is
+canonicalized, hashed with SHA-256, truncated, and Base62-encoded into a
+7-character code, then claimed with a single `INSERT ... ON CONFLICT DO NOTHING`
+([ADR 0007](docs/adr/0007-sha256-truncated-to-seven-base62-characters.md)).
+
+```bash
+curl -X POST localhost:4000/shorten -H 'content-type: application/json' -d '{"url":"https://example.com/some/very/long/path?a=1"}'
+```
 
 ```json
 {
-  "status": "ok",
-  "service": "url-generator-api",
-  "version": "0.1.0",
-  "uptimeSeconds": 4,
-  "dependencies": { "database": { "status": "ok", "latencyMs": 2 } }
+  "shortCode": "wYx0ePz",
+  "shortUrl": "http://localhost:4000/wYx0ePz",
+  "longUrl": "https://example.com/some/very/long/path?a=1",
+  "createdAt": "2026-08-27T01:28:00.220Z",
+  "created": true
 }
 ```
 
-When Postgres is unreachable the endpoint still answers 200 with
-`"status": "degraded"` and the underlying error — it reports liveness, and
-restarting the API would not fix the database.
+Codes are derived from the URL rather than allocated, so shortening the same
+destination twice returns the same code and stores one row — the response says
+so with `created: false` and a 200 instead of a 201. Two different URLs that
+hash to the same code are resolved by re-hashing with the attempt number, up to
+five times; exhausting that is a 500, never a silent duplicate.
 
-Nothing writes to the table yet. Phase 2 adds `POST /shorten`.
-
-The full roadmap is in [docs/design.md](docs/design.md#7-roadmap).
+`GET /{code}` does not exist yet, so the `shortUrl` above is a promise Phase 3
+keeps. The full roadmap is in [docs/design.md](docs/design.md#7-roadmap).
