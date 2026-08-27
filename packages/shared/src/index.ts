@@ -17,11 +17,28 @@ export interface DependencyHealth {
 }
 
 /**
+ * Health of the cache.
+ *
+ * Separate from `DependencyHealth` because it has a third state the others do
+ * not: the cache is optional, and a deployment that runs without one is
+ * configured rather than broken. `disabled` is not `unreachable`, and only the
+ * latter degrades the service.
+ */
+export interface CacheHealth {
+  status: 'ok' | 'unreachable' | 'disabled';
+  /** Round-trip time of the probe. Absent when the cache is `disabled`. */
+  latencyMs?: number;
+  /** Present only when `status` is `unreachable`. */
+  error?: string;
+}
+
+/**
  * Response body of `GET /health` on the API service.
  *
  * `status` is `degraded` when the process is up but something it depends on is
  * not. The endpoint still answers 200 in that case: it reports liveness, and an
- * orchestrator should not restart a healthy API because the database blinked.
+ * orchestrator should not restart a healthy API because the database blinked —
+ * still less because the cache did, since the read path is correct without it.
  */
 export interface HealthResponse {
   status: 'ok' | 'degraded';
@@ -30,6 +47,7 @@ export interface HealthResponse {
   uptimeSeconds: number;
   dependencies: {
     database: DependencyHealth;
+    cache: CacheHealth;
   };
 }
 

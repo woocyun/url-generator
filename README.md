@@ -15,6 +15,7 @@ The design is documented as it is built:
 | Web | Next.js 16 (App Router), React 19 |
 | API | Fastify 5 |
 | Database | Postgres 18 + Drizzle ORM |
+| Cache | Redis 8 (read path, cache-aside) |
 | Language | TypeScript 7, strict, everywhere |
 | Runtime | Node 22 |
 | Orchestration | Docker Compose |
@@ -43,6 +44,7 @@ docker compose up --build
 | Web | http://localhost:3000 |
 | API | http://localhost:4000/health |
 | Postgres | `localhost:5432` |
+| Redis | `localhost:6379` |
 
 `docker compose up` runs a one-shot `migrate` service first; the API waits for
 it to exit successfully, so the schema is always current before anything queries
@@ -56,6 +58,18 @@ To stop, and to drop the database volume with it:
 docker compose down -v
 ```
 
+Redis has no volume by design — it is a cache, and every key in it is
+reconstructible from Postgres ([ADR 0009](docs/adr/0009-redis-cache-aside-on-the-read-path.md)).
+
+When a phase adds a dependency, recreate the containers rather than restarting
+them: the `node_modules` volume is anonymous and Compose reuses it across a
+recreate, so the image's fresh `npm ci` stays masked until the container is
+replaced.
+
+```bash
+docker compose down && docker compose up --build -d
+```
+
 ## Working outside Docker
 
 Useful for type checking and quick iteration:
@@ -64,6 +78,10 @@ Useful for type checking and quick iteration:
 npm install
 npm run typecheck
 ```
+
+`REDIS_URL` is optional — leave it unset and the API runs without a cache,
+which is correct, just slower. `/health` reports the cache as `disabled` rather
+than `unreachable` in that case.
 
 ## Changing the schema
 
@@ -89,38 +107,47 @@ docker compose exec postgres psql -U urlshortener -d urlshortener
 
 ## Current status
 
-**Phase 3 — `GET /{code}`.** The loop closes: a link created by `POST /shorten`
-now resolves. The `shortUrl` from Phase 2 is a working link rather than a
-promise.
+**Phase 4 — Redis on the read path.** `GET /{code}` now resolves from a
+cache-aside lookup: Redis first, Postgres on a miss, and the result written
+back ([ADR 0009](docs/adr/0009-redis-cache-aside-on-the-read-path.md)).
 
 ```bash
-curl -i localhost:4000/wYx0ePz
+curl -s localhost:4000/health | jq .dependencies.cache
 ```
 
-```
-HTTP/1.1 302 Found
-location: https://example.com/some/very/long/path?a=1
-cache-control: no-store
+```json
+{ "status": "ok", "latencyMs": 1 }
 ```
 
-**302, not 301**, and nothing this route returns is cacheable
-([ADR 0008](docs/adr/0008-302-redirects-with-no-store-and-410-for-expired-links.md)).
-A 301 is faster for a repeat visitor exactly because the browser stops
-contacting us — and a link we never see again is one we cannot count, expire, or
-take down. The round-trip is what buys the link's lifecycle back, and it is
-cheap: a primary-key lookup on two columns, p50 0.53 ms / p99 1.41 ms locally
-against the design's 50 ms budget.
+**The cache is never a dependency.** Unreachable, slow, or empty all reach the
+read path as a miss — which is exactly Phase 3's behaviour. Stopping Redis
+outright leaves redirects answering in ~3 ms, writes working, and `/health`
+reporting `degraded` while still returning 200; the API reconnects on its own.
+That is the point of the phase: N1 asks for 99.99% on the redirect path, and a
+cache that can take that path down with it would be a net loss no matter how
+many round-trips it saved.
 
-An unknown code is a `404`; a code that resolves to a link past its expiry is a
-`410`, because a crawler that gets a 410 drops the URL while one that gets a 404
-keeps retrying. The expiry branch is live but unreachable through the public API
-until Phase 6 starts setting `expires_at` — the read path honours the column
-before the write path fills it.
+| | p50 | p99 |
+| --- | --- | --- |
+| Postgres lookup (Phase 3) | 0.156 ms | 0.588 ms |
+| Redis lookup | 0.052 ms | 0.086 ms |
+| `GET /{code}` end to end | 2.38 ms | 5.56 ms |
 
-Paths that cannot be short codes (`/favicon.ico`, `/robots.txt`, a scanner
-walking a wordlist) are answered from their shape without touching Postgres, so
-the hot path's round-trips track real traffic rather than whatever points at the
-origin.
+Which is the honest reading: at this scale the cache is not what makes the
+redirect fast — it already was, and the 50 ms budget is spent on HTTP, not on
+the lookup. What changes is the slope. Every hit is a query Postgres does not
+run, so read capacity stops being bounded by one database's connection pool.
 
-The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 4 puts
-a Redis cache in front of this lookup.
+**Misses are cached too**, for 30 seconds. `/{code}` is the catch-all under the
+origin, so without a negative entry a scanner walking seven-character strings
+costs one Postgres round-trip per guess. The write path deletes the entry when
+it creates a code, and the short TTL bounds the cases where that delete cannot
+help.
+
+Expiry and the destination check stay in the application, above the cache, so
+a link expires on schedule even when its entry has 59 minutes of TTL left, and
+a planted `javascript:` destination is refused on the cached path exactly as on
+the uncached one.
+
+The full roadmap is in [docs/design.md](docs/design.md#7-roadmap); Phase 5 adds
+custom aliases.

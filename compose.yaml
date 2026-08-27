@@ -43,6 +43,45 @@ services:
       retries: 12
       start_period: 10s
 
+  # The read path's cache (ADR 0009). Configured as a cache and not as a
+  # database, which is the whole reason it is safe to lose:
+  #
+  #   --save "" / --appendonly no  no persistence. Every key is reconstructible
+  #                                from Postgres, so writing them to disk buys
+  #                                a warm restart at the cost of fsyncs on the
+  #                                hot path and a file that can go stale.
+  #   --maxmemory                  a bound, so a scanner walking the code space
+  #                                cannot grow this container until something
+  #                                on the host dies.
+  #   allkeys-lru                  evict rather than refuse writes when full.
+  #                                An evicted key is a cache miss, which the
+  #                                read path already handles; a write that
+  #                                errors is a link that never gets cached.
+  #
+  # There is deliberately no volume: a cold cache is a slow minute, not data
+  # loss, and `docker compose down -v` should not be the only way to clear it.
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
   # Applies pending migrations and exits. The API waits on it completing
   # successfully, so the schema is never behind the code that queries it, and a
   # broken migration stops the stack here instead of surfacing as runtime
@@ -65,6 +104,7 @@ services:
       NODE_ENV: development
       API_PORT: 4000
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:4000}
+      REDIS_URL: redis://redis:6379
       <<: *database-url
     ports:
       - "${API_PORT:-4000}:4000"
@@ -73,6 +113,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # `service_started`, not `service_healthy`, and the difference is the
+      # point: the API must be able to boot without a working cache, because
+      # that is the state it has to survive in production (ADR 0009). Waiting
+      # on Redis here would make a dependency out of the one component the read
+      # path is designed not to need — and would mean a Redis that fails to
+      # start takes the whole stack with it.
+      redis:
+        condition: service_started
 
   web:
     build:

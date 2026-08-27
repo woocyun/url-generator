@@ -11,6 +11,7 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { env } from '../env.js';
+import { rootCauseMessage } from '../root-cause.js';
 import * as schema from './schema.js';
 
 const connection = postgres(env.databaseUrl, {
@@ -31,22 +32,6 @@ export interface DatabaseCheck {
   reachable: boolean;
   latencyMs: number;
   error?: string;
-}
-
-/**
- * Drizzle reports a failed query as "Failed query: ..." and hangs the real
- * fault off `cause`, so the useful part — `ECONNREFUSED`, an auth failure, a
- * missing database — is one or more levels down. Walk to the bottom of the
- * chain, which is what someone reading a health response actually needs.
- */
-function rootCauseMessage(error: unknown): string {
-  let current = error;
-
-  while (current instanceof Error && current.cause !== undefined) {
-    current = current.cause;
-  }
-
-  return current instanceof Error ? current.message : String(current);
 }
 
 /**

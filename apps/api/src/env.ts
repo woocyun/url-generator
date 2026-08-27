@@ -41,6 +41,34 @@ function readBaseUrl(name: string, fallback: string): string {
   return raw.replace(/\/+$/, '');
 }
 
+/**
+ * Reads a `redis://` connection string, if one is configured.
+ *
+ * Optional where `DATABASE_URL` is required, and the asymmetry is the design
+ * (ADR 0009): the API has no correct behaviour without Postgres, and it has
+ * fully correct — merely slower — behaviour without Redis. Unset means run
+ * without a cache, which is what `npm run dev` outside Compose does.
+ */
+function readCacheUrl(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${name} must be an absolute url, got: ${raw}`);
+  }
+
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    throw new Error(
+      `${name} must be a redis:// or rediss:// url, got: ${parsed.protocol.replace(':', '')}`,
+    );
+  }
+
+  return raw;
+}
+
 function readInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -85,4 +113,33 @@ export const env = {
     'PUBLIC_BASE_URL',
     `http://localhost:${readPort('API_PORT', 4000)}`,
   ),
+
+  /**
+   * Optional: unset runs the read path straight against Postgres, which is
+   * Phase 3's behaviour and still correct. See `readCacheUrl`.
+   */
+  redisUrl: readCacheUrl('REDIS_URL'),
+
+  /**
+   * How long a resolved mapping stays cached.
+   *
+   * Not a refresh interval — the cached columns do not change while the row
+   * exists (`db/mappings.ts`) — but a bound on how long a *deleted* row can
+   * still be served, since nothing but Phase 6's sweep and a takedown removes
+   * one and neither goes through this process. An hour keeps a viral link warm
+   * across a whole traffic spike while keeping the worst-case staleness short
+   * enough to explain to whoever asked for the takedown.
+   */
+  cacheTtlSeconds: readInt('CACHE_TTL_SECONDS', 3_600),
+
+  /**
+   * How long "there is no such code" stays cached.
+   *
+   * Two orders of magnitude shorter, because this one describes an absence
+   * that any `POST /shorten` can end. The write path deletes the entry when it
+   * creates the code, so this TTL only has to cover the case where Redis was
+   * unreachable during that write — short enough that the window is a blip,
+   * long enough to absorb a scanner walking the code space.
+   */
+  cacheNegativeTtlSeconds: readInt('CACHE_NEGATIVE_TTL_SECONDS', 30),
 } as const;

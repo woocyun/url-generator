@@ -56,8 +56,12 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
 
     // Cheap rejection of everything under the origin that cannot be a code —
     // `/favicon.ico`, `/robots.txt`, scanners walking a wordlist — before any
-    // of it reaches Postgres. Same 404 as an unknown code, deliberately: see
-    // `looksLikeShortCode`.
+    // of it reaches Postgres or Redis. Since Phase 4 it guards the cache's
+    // keyspace as well as the database's round-trips: without it, anything that
+    // can be spelled in a URL path would earn a negative cache entry, and the
+    // memory bound on the cache would be whatever points at the origin rather
+    // than the size of the link table. Same 404 as an unknown code,
+    // deliberately: see `looksLikeShortCode`.
     if (!looksLikeShortCode(code)) {
       return reply
         .code(404)
@@ -65,6 +69,16 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const resolution = await resolveShortCode(code);
+
+    // The one line that makes the cache observable. Every answer this route
+    // gives says whether it cost a Postgres round-trip, so the hit rate ADR
+    // 0009 is justified by is something the logs can be asked about rather
+    // than something we assume. Debug level: at design §2's read rate this is
+    // 11,500 lines a second, and Phase 9's metrics are where a counter belongs.
+    request.log.debug(
+      { shortCode: code, source: resolution.source, outcome: resolution.outcome },
+      'resolved short code',
+    );
 
     switch (resolution.outcome) {
       case 'found':

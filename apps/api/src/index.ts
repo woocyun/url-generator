@@ -8,6 +8,7 @@
  */
 
 import Fastify from 'fastify';
+import { attachCacheLogger, closeCache } from './cache/client.js';
 import { closeDatabase } from './db/client.js';
 import { env } from './env.js';
 import { registerErrorHandlers } from './errors.js';
@@ -42,6 +43,10 @@ const app = Fastify({
 
 registerErrorHandlers(app);
 
+// The Redis connection opens at module load, before this instance exists, so
+// its early events have nowhere to go until it is handed a logger.
+attachCacheLogger(app.log);
+
 await app.register(healthRoutes);
 await app.register(shortenRoutes);
 
@@ -66,7 +71,7 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     app.log.info(`received ${signal}, shutting down`);
     void app
       .close()
-      .then(() => closeDatabase())
+      .then(() => Promise.all([closeDatabase(), closeCache()]))
       .then(() => process.exit(0));
   });
 }

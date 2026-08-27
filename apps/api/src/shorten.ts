@@ -15,6 +15,7 @@
  *               silently duplicated or overwritten mapping
  */
 
+import { invalidateCachedTarget } from './cache/redirect-cache.js';
 import { findMappingByCode, insertMappingIfFree } from './db/mappings.js';
 import type { UrlMapping } from './db/schema.js';
 import { shortCodeFor } from './short-code.js';
@@ -56,6 +57,13 @@ export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> 
 
     const inserted = await insertMappingIfFree({ shortCode, longUrl: canonicalUrl });
     if (inserted !== undefined) {
+      // The code may have been asked for before it existed, and the read path
+      // caches that "no such code" answer (ADR 0009). Dropping the entry here
+      // is what keeps a link from answering 404 for the rest of a negative
+      // TTL immediately after being created. Best-effort — if Redis is
+      // unreachable this is a no-op and the short negative TTL is the backstop.
+      await invalidateCachedTarget(shortCode);
+
       return { outcome: 'created', mapping: inserted };
     }
 
@@ -64,6 +72,8 @@ export async function shortenUrl(canonicalUrl: string): Promise<ShortenOutcome> 
     // conflicted either way.
     const occupant = await findMappingByCode(shortCode);
 
+    // No invalidation on this branch: the row already existed, nothing about
+    // it changed, and whatever the cache holds for the code is still true.
     if (occupant !== undefined && occupant.longUrl === canonicalUrl) {
       return { outcome: 'existing', mapping: occupant };
     }
